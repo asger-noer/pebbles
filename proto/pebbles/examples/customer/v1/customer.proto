@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package pebbles.examples.customer.v1;
+
+message CustomerNameUpdated {
+  string name = 1;
+}
+
+message CustomerEmailUpdated {
+  string email = 1;
+}

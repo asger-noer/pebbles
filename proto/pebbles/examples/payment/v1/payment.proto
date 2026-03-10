@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package pebbles.examples.payment.v1;
+
+message PaymentCaptured {
+  string order_id = 1;
+  int32  amount   = 2;
+}

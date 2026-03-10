@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package pebbles.examples.order.v2;
+
+// ItemAdded prices in integer cents plus an explicit currency, fixing the
+// v1 assumption that price was always whole US dollars. Supersedes
+// pebbles.examples.order.v1.ItemAdded; an upcaster maps v1 -> v2.
+message ItemAdded {
+  string name          = 1;
+  int32  price_cents   = 2;
+  string currency_code = 3;
+}

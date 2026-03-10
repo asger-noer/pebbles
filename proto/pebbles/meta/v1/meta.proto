@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package pebbles.meta.v1;
+
+// Deleted is a tombstone event appended to a stream when it is permanently
+// removed. It carries no payload; the envelope (StreamID, At) is the record.
+message Deleted {}

@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package pebbles.examples.order.v1;
+
+message CartMade {
+  string customer_id = 1;
+}
+
+// ItemAdded is the original shape: price was always whole US dollars, so we
+// never bothered with a currency field. Superseded by
+// pebbles.examples.order.v2.ItemAdded, which prices in integer cents plus an
+// explicit currency; an upcaster maps v1 -> v2.
+message ItemAdded {
+  string name = 1;
+  int32 price = 2;
+}
+
+message OrderPlaced {}
+
+message DeliveryAddressUpdated {
+  string address = 1;
+}
+
+message OrderShipped {
+  string carrier = 1;
+  string tracking = 2;
+}
