@@ -102,14 +102,14 @@ func main() {
 	// Two orders for the same customer, on their own streams. Only OrderPlaced
 	// carries the customer id.
 	order1, order2 := uuid.New(), uuid.New()
-	if err := orders.Append(ctx, nil, order1,
+	if err := orders.Append(ctx, order1,
 		&orderv1.CartMade{CustomerId: customer.String()},
 		&orderv2.ItemAdded{Name: "Keyboard", PriceCents: 4200, CurrencyCode: "USD"},
 		&orderv2.ItemAdded{Name: "Mouse", PriceCents: 1800, CurrencyCode: "USD"},
 	); err != nil {
 		panic(err)
 	}
-	if err := orders.Append(ctx, nil, order2,
+	if err := orders.Append(ctx, order2,
 		&orderv1.CartMade{CustomerId: customer.String()},
 		&orderv2.ItemAdded{Name: "USB Cable", PriceCents: 999, CurrencyCode: "USD"},
 	); err != nil {

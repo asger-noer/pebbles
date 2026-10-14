@@ -48,30 +48,39 @@ func (f *Folder[M, E]) Apply(state M, ev E) M {
 // codecs, asserts it satisfies E, and applies it. An empty stream returns
 // Initial().
 func (f *Folder[M, E]) Fold(ctx context.Context, streamID uuid.UUID) (M, error) {
+	state, _, err := f.FoldWithSequence(ctx, streamID)
+	return state, err
+}
+
+// FoldWithSequence returns the folded state and the sequence of its last event.
+// An empty stream has sequence 0.
+func (f *Folder[M, E]) FoldWithSequence(ctx context.Context, streamID uuid.UUID) (M, int64, error) {
 	state := f.projector.Initial()
 
 	events, err := f.reader.Read(ctx, f.projector.StreamType(), streamID, 0)
 	if err != nil {
-		return state, fmt.Errorf("reading events from store: %w", err)
+		return state, 0, fmt.Errorf("reading events from store: %w", err)
 	}
 
+	var sequence int64
 	for _, raw := range events {
 		if raw.Name == pebbles.DeletedName {
-			return state, pebbles.ErrDeleted
+			return state, sequence, pebbles.ErrDeleted
 		}
 
 		payload, err := f.codecs.Hydrate(raw.Name, raw.Data)
 		if err != nil {
-			return state, fmt.Errorf("hydrating event %s: %w", raw.Name, err)
+			return state, sequence, fmt.Errorf("hydrating event %s: %w", raw.Name, err)
 		}
 
 		ev, ok := payload.(E)
 		if !ok {
-			return state, fmt.Errorf("hydrated %s as %T, which does not satisfy %T", raw.Name, payload, new(E))
+			return state, sequence, fmt.Errorf("hydrated %s as %T, which does not satisfy %T", raw.Name, payload, new(E))
 		}
 
 		state = f.projector.Apply(state, ev)
+		sequence = raw.Sequence
 	}
 
-	return state, nil
+	return state, sequence, nil
 }

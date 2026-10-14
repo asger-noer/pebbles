@@ -16,7 +16,7 @@ func appendEvent(t *testing.T, s *memory.Engine, streamType string, seq int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(context.Background(), nil, store.Event{
+	if err := s.Append(context.Background(), store.Event{
 		ID:         id,
 		StreamType: streamType,
 		StreamID:   uuid.New(),
@@ -26,6 +26,44 @@ func appendEvent(t *testing.T, s *memory.Engine, streamType string, seq int64) {
 		Data:       []byte{},
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAppendBatchIsAtomicOnSequenceConflict(t *testing.T) {
+	ctx := context.Background()
+	s := memory.New()
+	streamID := uuid.New()
+	event := func(sequence int64) store.Event {
+		return store.Event{
+			ID:         uuid.New(),
+			StreamType: "order",
+			StreamID:   streamID,
+			Sequence:   sequence,
+			Name:       "test.Event",
+			At:         time.Now().UTC(),
+		}
+	}
+
+	if err := s.AppendBatch(ctx, []store.Event{event(1), event(1)}); err != store.ErrConflict {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+	last, err := s.LastSequence(ctx, "order", streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last != 0 {
+		t.Fatalf("want failed batch to leave stream empty, last sequence is %d", last)
+	}
+}
+
+func TestAppendBatchRejectsMixedStreams(t *testing.T) {
+	s := memory.New()
+	events := []store.Event{
+		{ID: uuid.New(), StreamType: "order", StreamID: uuid.New(), Sequence: 1},
+		{ID: uuid.New(), StreamType: "order", StreamID: uuid.New(), Sequence: 1},
+	}
+	if err := s.AppendBatch(context.Background(), events); err != store.ErrMixedStreams {
+		t.Fatalf("want ErrMixedStreams, got %v", err)
 	}
 }
 

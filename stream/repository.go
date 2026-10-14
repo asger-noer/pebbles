@@ -14,7 +14,6 @@ import (
 	"github.com/asger-noer/pebbles/internal/fold"
 	"github.com/asger-noer/pebbles/store"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -58,19 +57,19 @@ func (r *Repository[S, E]) Load(ctx context.Context, streamID uuid.UUID) (S, err
 // this repository directly, since Execute itself owns persistence.
 type ExecuteFunc[S any, E pebbles.Event] func(ctx context.Context, state S) ([]E, error)
 
-// Execute loads current state, calls fn to produce events, appends them if fn
-// succeeds, and returns the final state after applying the new events locally.
-// tx is an optional caller-managed transaction, passed through to Append — see
-// [Repository.Append]. Returns [store.ErrConflict] if a concurrent writer
-// claimed the next sequence — callers should reload and retry.
+// Execute loads current state and its stream revision, calls fn, and appends
+// events at that revision if fn succeeds. The revision check prevents a stale
+// command from appending after a concurrent write to this stream. Cross-stream
+// invariants should be handled asynchronously. Returns [store.ErrConflict] if a
+// concurrent writer claimed the next sequence; callers should rerun Execute to
+// reload state and revalidate the command.
 func (r *Repository[S, E]) Execute(
 	ctx context.Context,
-	tx pgx.Tx,
 	streamID uuid.UUID,
 	fn ExecuteFunc[S, E],
 ) (S, error) {
 	var zero S
-	state, err := r.Load(ctx, streamID)
+	state, revision, err := r.folder.FoldWithSequence(ctx, streamID)
 	if err != nil {
 		return zero, fmt.Errorf("loading state: %w", err)
 	}
@@ -80,7 +79,7 @@ func (r *Repository[S, E]) Execute(
 		return zero, fmt.Errorf("executing function: %w", err)
 	}
 
-	if err := r.Append(ctx, tx, streamID, events...); err != nil {
+	if err := r.appendAtRevision(ctx, streamID, revision, events...); err != nil {
 		return zero, fmt.Errorf("appending events: %w", err)
 	}
 
@@ -93,11 +92,10 @@ func (r *Repository[S, E]) Execute(
 
 // Delete appends a [pebbles.Deleted] tombstone to the stream. Any middleware
 // in the pipeline (e.g. CryptoShredMiddleware) handles post-write cleanup such
-// as crypto-shredding the stream's key. tx is an optional caller-managed
-// transaction — see [Repository.Append]. Returns [store.ErrConflict] on a
+// as crypto-shredding the stream's key. Returns [store.ErrConflict] on a
 // concurrent writer.
-func (r *Repository[S, E]) Delete(ctx context.Context, tx pgx.Tx, streamID uuid.UUID) error {
-	last, err := r.store.LastSequence(ctx, tx, r.streamType, streamID)
+func (r *Repository[S, E]) Delete(ctx context.Context, streamID uuid.UUID) error {
+	last, err := r.store.LastSequence(ctx, r.streamType, streamID)
 	if err != nil {
 		return fmt.Errorf("fetching last sequence: %w", err)
 	}
@@ -122,26 +120,32 @@ func (r *Repository[S, E]) Delete(ctx context.Context, tx pgx.Tx, streamID uuid.
 		Headers:    map[string][]string{},
 		Data:       data,
 	}
-	return r.store.Append(ctx, tx, tombstone)
+	return r.store.Append(ctx, tombstone)
 }
 
 // Append writes events in order, auto-assigning sequence numbers starting at
-// LastSequence+1. tx is an optional caller-managed transaction — pass nil to
-// let the store manage its own write, or a [pgx.Tx] to scope this append (and
-// any others sharing the same tx, including across other repositories) to one
-// atomic transaction. Returns [store.ErrConflict] if a concurrent writer beat
-// us to a sequence — callers should reload state and retry.
-func (r *Repository[S, E]) Append(ctx context.Context, tx pgx.Tx, streamID uuid.UUID, events ...E) error {
+// LastSequence+1. Returns [store.ErrConflict] if a concurrent writer beat us to
+// a sequence — callers should reload state and retry.
+func (r *Repository[S, E]) Append(ctx context.Context, streamID uuid.UUID, events ...E) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	last, err := r.store.LastSequence(ctx, tx, r.streamType, streamID)
+	last, err := r.store.LastSequence(ctx, r.streamType, streamID)
 	if err != nil {
 		return fmt.Errorf("fetching last sequence: %w", err)
 	}
 
+	return r.appendAtRevision(ctx, streamID, last, events...)
+}
+
+func (r *Repository[S, E]) appendAtRevision(ctx context.Context, streamID uuid.UUID, revision int64, events ...E) error {
+	if len(events) == 0 {
+		return nil
+	}
+
 	now := time.Now().UTC()
+	batch := make([]store.Event, 0, len(events))
 
 	for i, ev := range events {
 		id, err := uuid.NewV7()
@@ -158,17 +162,18 @@ func (r *Repository[S, E]) Append(ctx context.Context, tx pgx.Tx, streamID uuid.
 			ID:         id,
 			StreamType: r.streamType,
 			StreamID:   streamID,
-			Sequence:   last + int64(i) + 1,
+			Sequence:   revision + int64(i) + 1,
 			Name:       name,
 			At:         now,
 			Headers:    map[string][]string{},
 			Data:       data,
 		}
 
-		if err := r.store.Append(ctx, tx, event); err != nil {
-			return fmt.Errorf("appending event %d: %w", i, err)
-		}
+		batch = append(batch, event)
 	}
 
+	if err := r.store.AppendBatch(ctx, batch...); err != nil {
+		return fmt.Errorf("appending event batch: %w", err)
+	}
 	return nil
 }

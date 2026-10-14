@@ -11,7 +11,6 @@ import (
 	"github.com/asger-noer/pebbles/internal/aesgcm"
 	"github.com/asger-noer/pebbles/store"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
 // CryptoShredMiddleware implements [store.Middleware] using per-stream
@@ -32,15 +31,17 @@ func NewCryptoShredMiddleware() *CryptoShredMiddleware {
 	return &CryptoShredMiddleware{keys: make(map[uuid.UUID][]byte)}
 }
 
-// Append is the write-path hook. It:
-//  1. Auto-creates a key for new streams (no key yet).
-//  2. Encrypts e.Data before passing it to next (no-op for the tombstone, which has no data).
-//  3. Calls next to persist the event.
-//  4. After a successful tombstone write, deletes the stream's key (crypto-shred).
-func (m *CryptoShredMiddleware) Append(ctx context.Context, tx pgx.Tx, e store.Event, next store.AppendFunc) error {
-	isTombstone := e.Name == pebbles.DeletedName
+// Append creates keys and encrypts event data before persisting the batch. It
+// deletes keys for tombstoned streams after the batch succeeds.
+func (m *CryptoShredMiddleware) Append(ctx context.Context, events []store.Event, next store.AppendFunc) error {
+	var tombstones []uuid.UUID
+	for i := range events {
+		e := &events[i]
+		if e.Name == pebbles.DeletedName {
+			tombstones = append(tombstones, e.StreamID)
+			continue
+		}
 
-	if !isTombstone {
 		if err := m.ensureKey(e.StreamID); err != nil {
 			return err
 		}
@@ -54,13 +55,15 @@ func (m *CryptoShredMiddleware) Append(ctx context.Context, tx pgx.Tx, e store.E
 		}
 	}
 
-	if err := next(ctx, tx, e); err != nil {
+	if err := next(ctx, events); err != nil {
 		return err
 	}
 
-	if isTombstone {
+	if len(tombstones) > 0 {
 		m.mu.Lock()
-		delete(m.keys, e.StreamID)
+		for _, streamID := range tombstones {
+			delete(m.keys, streamID)
+		}
 		m.mu.Unlock()
 	}
 

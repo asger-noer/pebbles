@@ -15,6 +15,7 @@ import (
 )
 
 type orderAggregate struct{}
+type transitionAggregate struct{}
 
 func (orderAggregate) StreamType() string { return "order" }
 func (orderAggregate) Initial() Summary   { return Summary{} }
@@ -24,6 +25,12 @@ func (orderAggregate) Apply(s Summary, e pebbles.Event) Summary {
 		s.Total += int(c.GetPriceCents())
 	}
 	return s
+}
+
+func (transitionAggregate) StreamType() string { return "transition" }
+func (transitionAggregate) Initial() bool      { return false }
+func (transitionAggregate) Apply(_ bool, _ pebbles.Event) bool {
+	return true
 }
 
 func newOrderRegistry(t *testing.T) *codec.Registry[orderAggregate] {
@@ -44,7 +51,7 @@ func TestRepositoryAppendAndLoad(t *testing.T) {
 	repo := newRepo(t, st)
 	id := uuid.New()
 
-	if err := repo.Append(ctx, nil, id,
+	if err := repo.Append(ctx, id,
 		&orderv2.ItemAdded{Name: "Keyboard", PriceCents: 10},
 		&orderv2.ItemAdded{Name: "Mouse", PriceCents: 5},
 	); err != nil {
@@ -65,10 +72,10 @@ func TestRepositoryDeleteReturnsErrDeleted(t *testing.T) {
 	repo := newRepo(t, st)
 	id := uuid.New()
 
-	if err := repo.Append(ctx, nil, id, &orderv2.ItemAdded{Name: "Keyboard", PriceCents: 10}); err != nil {
+	if err := repo.Append(ctx, id, &orderv2.ItemAdded{Name: "Keyboard", PriceCents: 10}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.Delete(ctx, nil, id); err != nil {
+	if err := repo.Delete(ctx, id); err != nil {
 		t.Fatal(err)
 	}
 
@@ -78,20 +85,63 @@ func TestRepositoryDeleteReturnsErrDeleted(t *testing.T) {
 	}
 }
 
+func TestRepositoryExecuteRejectsStaleTransition(t *testing.T) {
+	ctx := context.Background()
+	st := store.New(memory.New())
+	codecs := codec.NewRegistry[transitionAggregate]()
+	codec.Register[*orderv2.ItemAdded](codecs)
+	repo := stream.NewRepository(codecs, st)
+	id := uuid.New()
+
+	loaded := make(chan struct{})
+	resume := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := repo.Execute(ctx, id, func(context.Context, bool) ([]pebbles.Event, error) {
+			close(loaded)
+			<-resume
+			return []pebbles.Event{&orderv2.ItemAdded{Name: "completion"}}, nil
+		})
+		result <- err
+	}()
+
+	<-loaded
+	if _, err := repo.Execute(ctx, id, func(_ context.Context, complete bool) ([]pebbles.Event, error) {
+		if complete {
+			t.Fatal("expected incomplete state")
+		}
+		return []pebbles.Event{&orderv2.ItemAdded{Name: "completion"}}, nil
+	}); err != nil {
+		t.Fatalf("executing first transition: %v", err)
+	}
+	close(resume)
+
+	if err := <-result; !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("want stale transition to return ErrConflict, got %v", err)
+	}
+	events, err := st.Read(ctx, "transition", id, 0)
+	if err != nil {
+		t.Fatalf("reading events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("want exactly one completion event, got %d", len(events))
+	}
+}
+
 func TestRepositoryExecuteReturnsErrDeletedOnDeletedStream(t *testing.T) {
 	ctx := context.Background()
 	st := store.New(memory.New())
 	repo := newRepo(t, st)
 	id := uuid.New()
 
-	if err := repo.Append(ctx, nil, id, &orderv2.ItemAdded{Name: "Keyboard", PriceCents: 10}); err != nil {
+	if err := repo.Append(ctx, id, &orderv2.ItemAdded{Name: "Keyboard", PriceCents: 10}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.Delete(ctx, nil, id); err != nil {
+	if err := repo.Delete(ctx, id); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := repo.Execute(ctx, nil, id, func(context.Context, Summary) ([]pebbles.Event, error) {
+	_, err := repo.Execute(ctx, id, func(context.Context, Summary) ([]pebbles.Event, error) {
 		return []pebbles.Event{&orderv2.ItemAdded{Name: "Mouse", PriceCents: 5}}, nil
 	})
 	if !errors.Is(err, pebbles.ErrDeleted) {

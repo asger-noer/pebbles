@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 
 	"github.com/asger-noer/pebbles"
@@ -68,37 +69,53 @@ func New(ctx context.Context, pool *pgxpool.Pool) (*Engine, error) {
 	}, nil
 }
 
-// Append persists e. tx is an optional caller-managed transaction; when
-// provided, the insert runs against it via [queries.Queries.WithTx] instead of
-// the pool, so it can be committed atomically alongside other appends the
-// caller shares the same tx with.
-//
-// Waking listening projection runners is not this method's job: an insert
-// trigger on pebbles.event emits the notification, so it happens for every
-// writer and cannot be forgotten here. See migration 004_event_notify.sql.
-func (s *Engine) Append(ctx context.Context, tx pgx.Tx, e store.Event) error {
-	headers, err := json.Marshal(e.Headers)
+// Append persists one event. AppendBatch writes all events in one transaction.
+// An insert trigger on pebbles.event wakes listening projection runners.
+func (s *Engine) Append(ctx context.Context, e store.Event) error {
+	return s.AppendBatch(ctx, []store.Event{e})
+}
+
+// AppendBatch writes all events atomically.
+func (s *Engine) AppendBatch(ctx context.Context, events []store.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	first := events[0]
+	for _, e := range events[1:] {
+		if e.StreamType != first.StreamType || e.StreamID != first.StreamID {
+			return store.ErrMixedStreams
+		}
+	}
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	q := s.queries
-	if tx != nil {
-		q = q.WithTx(tx)
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	q := s.queries.WithTx(tx)
+	for i, e := range events {
+		headers, err := json.Marshal(e.Headers)
+		if err != nil {
+			return fmt.Errorf("marshaling headers for event %d: %w", i, err)
+		}
+		err = q.AppendEvent(ctx, queries.AppendEventParams{
+			ID:         e.ID,
+			StreamType: e.StreamType,
+			StreamID:   e.StreamID,
+			Sequence:   e.Sequence,
+			Name:       e.Name,
+			At:         pgtype.Timestamptz{Time: e.At, Valid: true},
+			Headers:    headers,
+			Data:       e.Data,
+		})
+		if isUniqueViolation(err) {
+			return store.ErrConflict
+		}
+		if err != nil {
+			return fmt.Errorf("appending event %d: %w", i, err)
+		}
 	}
-	err = q.AppendEvent(ctx, queries.AppendEventParams{
-		ID:         e.ID,
-		StreamType: e.StreamType,
-		StreamID:   e.StreamID,
-		Sequence:   e.Sequence,
-		Name:       e.Name,
-		At:         pgtype.Timestamptz{Time: e.At, Valid: true},
-		Headers:    headers,
-		Data:       e.Data,
-	})
-	if isUniqueViolation(err) {
-		return store.ErrConflict
-	}
-	return err
+	return tx.Commit(ctx)
 }
 
 func (s *Engine) Read(ctx context.Context, streamType string, streamID uuid.UUID, fromSequence int64) ([]store.Event, error) {
@@ -161,12 +178,8 @@ func (s *Engine) ReadAll(ctx context.Context, from int64, limit int) ([]store.Po
 	return out, nil
 }
 
-func (s *Engine) LastSequence(ctx context.Context, tx pgx.Tx, streamType string, streamID uuid.UUID) (int64, error) {
-	q := s.queries
-	if tx != nil {
-		q = q.WithTx(tx)
-	}
-	seq, err := q.LastSequence(ctx, queries.LastSequenceParams{
+func (s *Engine) LastSequence(ctx context.Context, streamType string, streamID uuid.UUID) (int64, error) {
+	seq, err := s.queries.LastSequence(ctx, queries.LastSequenceParams{
 		StreamType: streamType,
 		StreamID:   streamID,
 	})

@@ -37,7 +37,7 @@ func appendEvent(t *testing.T, s *memory.Engine, codecs codec.Registrar, seq int
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(context.Background(), nil, store.Event{
+	if err := s.Append(context.Background(), store.Event{
 		ID:         id,
 		StreamType: codecs.StreamType(),
 		StreamID:   uuid.New(),
@@ -63,7 +63,7 @@ func appendToStream(t *testing.T, s *memory.Engine, codecs codec.Registrar, stre
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(context.Background(), nil, store.Event{
+	if err := s.Append(context.Background(), store.Event{
 		ID:         id,
 		StreamType: codecs.StreamType(),
 		StreamID:   streamID,
@@ -90,7 +90,7 @@ func appendStreamTombstone(t *testing.T, s *memory.Engine, streamType string, st
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(context.Background(), nil, store.Event{
+	if err := s.Append(context.Background(), store.Event{
 		ID:         id,
 		StreamType: streamType,
 		StreamID:   streamID,

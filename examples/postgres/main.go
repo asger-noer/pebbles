@@ -13,7 +13,6 @@ import (
 	"github.com/asger-noer/pebbles/store/postgres"
 	"github.com/asger-noer/pebbles/stream"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -96,32 +95,25 @@ func main() {
 
 	customerID, orderID := uuid.New(), uuid.New()
 
-	// Open one transaction and share it across both repositories: the
-	// customer's registration and their first order either both land in the
-	// log, or neither does.
-	if err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
-		if err := customers.Append(ctx, tx, customerID,
-			&customerv1.CustomerNameUpdated{Name: "Ada"},
-			&customerv1.CustomerEmailUpdated{Email: "ada@pebbles.com"},
-		); err != nil {
-			panic(err)
-		}
+	// These streams commit independently. Cross-stream work should use an
+	// asynchronous workflow rather than one transaction.
+	if err := customers.Append(ctx, customerID,
+		&customerv1.CustomerNameUpdated{Name: "Ada"},
+		&customerv1.CustomerEmailUpdated{Email: "ada@pebbles.com"},
+	); err != nil {
+		panic(err)
+	}
 
-		if err := orders.Append(ctx, tx, orderID,
-			&orderv1.CartMade{CustomerId: customerID.String()},
-			&orderv2.ItemAdded{Name: "Keyboard", PriceCents: 4200, CurrencyCode: "USD"},
-			&orderv2.ItemAdded{Name: "Mouse", PriceCents: 2500, CurrencyCode: "USD"},
-			&orderv2.ItemAdded{Name: "Monitor", PriceCents: 24900, CurrencyCode: "USD"},
-			&orderv2.ItemAdded{Name: "USB-C Hub", PriceCents: 7900, CurrencyCode: "USD"},
-			&orderv1.DeliveryAddressUpdated{Address: "1 Infinite Loop, Cupertino"},
-			&orderv1.OrderPlaced{},
-			&orderv1.OrderShipped{},
-		); err != nil {
-			panic(err)
-		}
-
-		return nil
-	}); err != nil {
+	if err := orders.Append(ctx, orderID,
+		&orderv1.CartMade{CustomerId: customerID.String()},
+		&orderv2.ItemAdded{Name: "Keyboard", PriceCents: 4200, CurrencyCode: "USD"},
+		&orderv2.ItemAdded{Name: "Mouse", PriceCents: 2500, CurrencyCode: "USD"},
+		&orderv2.ItemAdded{Name: "Monitor", PriceCents: 24900, CurrencyCode: "USD"},
+		&orderv2.ItemAdded{Name: "USB-C Hub", PriceCents: 7900, CurrencyCode: "USD"},
+		&orderv1.DeliveryAddressUpdated{Address: "1 Infinite Loop, Cupertino"},
+		&orderv1.OrderPlaced{},
+		&orderv1.OrderShipped{},
+	); err != nil {
 		panic(err)
 	}
 

@@ -24,7 +24,7 @@ func appendEncEvent(t *testing.T, s *store.Store, streamType string, streamID uu
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(context.Background(), nil, store.Event{
+	if err := s.Append(context.Background(), store.Event{
 		ID:         id,
 		StreamType: streamType,
 		StreamID:   streamID,
@@ -44,7 +44,7 @@ func appendTombstone(t *testing.T, s *store.Store, streamType string, streamID u
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(context.Background(), nil, store.Event{
+	if err := s.Append(context.Background(), store.Event{
 		ID:         id,
 		StreamType: streamType,
 		StreamID:   streamID,

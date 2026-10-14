@@ -20,12 +20,19 @@ The default implementation uses PostgreSQL or in-memorry, but other databases ca
 
 Events are immutable, and the source of truth for the state of the system. They are stored in an append-only log, and can be replayed to reconstruct the state of the system at any point in time. Schema evolution happens by adding a new message and registering an upcaster (`codec.RegisterUpcaster`) from the old message to the new one, keyed by message name — old events are never rewritten, only upcast at read time.
 
-### Transactions
+### Consistency boundaries
 
-`stream.Repository.Append` (and `.Delete` / `.Execute`) take an explicit
-`pgx.Tx` parameter. Pass `nil` to let the store manage its own write, or open
-a transaction yourself to atomically append to multiple streams — even across
-different repositories — in one commit.
+`stream.Repository.Append`, `.Delete`, and `.Execute` do not accept caller
+transactions. Pebbles commits each event batch to one stream atomically.
+`Repository.Execute` also checks that its stream has not changed since it loaded
+state. Writes to different streams commit independently. Keep invariants that
+need immediate enforcement in one aggregate.
+
+For cross-stream rules, record the relevant facts or requests, then apply the
+policy asynchronously. Use a `projection.Handler` and `projection.Runner` as
+the event consumer. Consumers receive events at least once, so make their
+outputs idempotent. Model pending outcomes and, when needed, compensating events
+instead of coordinating writes across aggregates.
 
 ## Folding events into state
 

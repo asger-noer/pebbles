@@ -84,7 +84,7 @@ func main() {
 	repo := stream.NewRepository(codecs, st)
 
 	oldOrderID := uuid.New()
-	if err := repo.Append(ctx, nil, oldOrderID,
+	if err := repo.Append(ctx, oldOrderID,
 		&orderv1.CartMade{CustomerId: uuid.New().String()},
 		&orderv1.ItemAdded{Name: "Keyboard", Price: 42},
 		&orderv1.DeliveryAddressUpdated{Address: "1 Infinite Loop, Cupertino"},
@@ -107,7 +107,7 @@ func main() {
 		}, nil
 	}
 
-	state, err := repo.Execute(ctx, nil, newOrderID, newOrder)
+	state, err := repo.Execute(ctx, newOrderID, newOrder)
 	if err != nil {
 		panic(err)
 	}

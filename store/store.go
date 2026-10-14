@@ -3,16 +3,20 @@ package store
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
 // ErrConflict is returned when an append violates the (stream_id, sequence)
 // uniqueness invariant — i.e. another writer has already produced an event at
 // the given sequence number.
 var ErrConflict = errors.New("pebbles: sequence conflict")
+
+// ErrMixedStreams is returned when an atomic append batch contains events for
+// more than one stream.
+var ErrMixedStreams = errors.New("pebbles: append batch must target one stream")
 
 // ErrNotFound is returned when a requested event or stream does not exist.
 var ErrNotFound = errors.New("pebbles: not found")
@@ -52,15 +56,14 @@ type Positioned struct {
 // (memory, postgres, …). Use [New] to wrap an Engine with optional middleware
 // into a [Store].
 //
-// Append takes an explicit tx so a caller can scope multiple appends —
-// including across streams and repositories — to one database transaction.
-// tx is nil when the caller has no transaction to share; backends without a
-// real transaction concept (e.g. the in-memory engine) ignore it.
+// Append persists one event. AppendBatch persists events for one stream
+// atomically. Each backend owns the transaction boundary for both operations.
 type Engine interface {
-	Append(ctx context.Context, tx pgx.Tx, e Event) error
+	Append(ctx context.Context, e Event) error
+	AppendBatch(ctx context.Context, events []Event) error
 	Read(ctx context.Context, streamType string, streamID uuid.UUID, fromSequence int64) ([]Event, error)
 	ReadAll(ctx context.Context, from int64, limit int) ([]Positioned, error)
-	LastSequence(ctx context.Context, tx pgx.Tx, streamType string, streamID uuid.UUID) (int64, error)
+	LastSequence(ctx context.Context, streamType string, streamID uuid.UUID) (int64, error)
 	ListStreams(ctx context.Context, streamType string) ([]uuid.UUID, error)
 }
 
@@ -96,20 +99,14 @@ type CheckpointStore interface {
 }
 
 // AppendFunc is a step in the append middleware chain. Calling it persists the
-// event (or passes it to the next middleware in the chain).
-type AppendFunc func(ctx context.Context, tx pgx.Tx, e Event) error
+// events or passes them to the next middleware.
+type AppendFunc func(ctx context.Context, events []Event) error
 
-// Middleware intercepts store operations. Append wraps the full write path:
-// transform e, call next to persist it, then run any post-write logic (e.g.
-// shred the key after a tombstone). OnRead transforms events on the way out of
-// the store. Returning an error from either hook aborts the operation.
-//
-// tx is the same caller-supplied transaction passed to [Store.Append]; a
-// middleware that itself touches the database (e.g. a per-stream key table)
-// should use it so its writes land in the same transaction as the event
-// insert.
+// Middleware intercepts store operations. Append wraps an atomic single-stream
+// batch write. OnRead transforms events as they leave the store. An error from
+// either hook aborts the operation.
 type Middleware interface {
-	Append(ctx context.Context, tx pgx.Tx, e Event, next AppendFunc) error
+	Append(ctx context.Context, events []Event, next AppendFunc) error
 	OnRead(ctx context.Context, e Event) (Event, error)
 }
 
@@ -128,19 +125,32 @@ func New(engine Engine, mw ...Middleware) *Store {
 	return &Store{engine: engine, mw: mw}
 }
 
-// Append persists e. tx is an optional caller-managed transaction — pass nil
-// to let the store manage its own write, or a [pgx.Tx] to scope this append
-// (and any others sharing the same tx) to one atomic transaction.
-func (s *Store) Append(ctx context.Context, tx pgx.Tx, e Event) error {
-	return s.buildChain(0)(ctx, tx, e)
+// Append persists one event through the middleware chain.
+func (s *Store) Append(ctx context.Context, e Event) error {
+	return s.AppendBatch(ctx, e)
+}
+
+// AppendBatch persists all events for one stream as one atomic write through
+// the middleware chain.
+func (s *Store) AppendBatch(ctx context.Context, events ...Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	first := events[0]
+	for _, e := range events[1:] {
+		if e.StreamType != first.StreamType || e.StreamID != first.StreamID {
+			return ErrMixedStreams
+		}
+	}
+	return s.buildChain(0)(ctx, events)
 }
 
 func (s *Store) buildChain(i int) AppendFunc {
 	if i >= len(s.mw) {
-		return s.engine.Append
+		return s.engine.AppendBatch
 	}
-	return func(ctx context.Context, tx pgx.Tx, e Event) error {
-		return s.mw[i].Append(ctx, tx, e, s.buildChain(i+1))
+	return func(ctx context.Context, events []Event) error {
+		return s.mw[i].Append(ctx, events, s.buildChain(i+1))
 	}
 }
 
@@ -168,9 +178,9 @@ func (s *Store) ReadAll(ctx context.Context, from int64, limit int) ([]Positione
 }
 
 // LastSequence returns the highest sequence number appended to the stream so
-// far. tx is an optional caller-managed transaction — see [Engine.LastSequence].
-func (s *Store) LastSequence(ctx context.Context, tx pgx.Tx, streamType string, streamID uuid.UUID) (int64, error) {
-	return s.engine.LastSequence(ctx, tx, streamType, streamID)
+// far.
+func (s *Store) LastSequence(ctx context.Context, streamType string, streamID uuid.UUID) (int64, error) {
+	return s.engine.LastSequence(ctx, streamType, streamID)
 }
 
 func (s *Store) ListStreams(ctx context.Context, streamType string) ([]uuid.UUID, error) {
@@ -180,8 +190,8 @@ func (s *Store) ListStreams(ctx context.Context, streamType string) ([]uuid.UUID
 func (s *Store) applyOnRead(ctx context.Context, events []Event) ([]Event, error) {
 	for i := range events {
 		var err error
-		for j := len(s.mw) - 1; j >= 0; j-- {
-			events[i], err = s.mw[j].OnRead(ctx, events[i])
+		for _, v := range slices.Backward(s.mw) {
+			events[i], err = v.OnRead(ctx, events[i])
 			if err != nil {
 				return nil, err
 			}

@@ -7,22 +7,21 @@ import (
 
 	"github.com/asger-noer/pebbles/store"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
-func TestEncryptionMiddlewareRoundTrip(t *testing.T) {
-	masterKey := bytes.Repeat([]byte("k"), 32)
-	mw := store.NewEncryptionMiddleware(masterKey)
-
-	streamID := uuid.New()
-	plaintext := []byte("hello world")
-	e := store.Event{StreamID: streamID, Data: plaintext}
-
+func appendThrough(mw store.Middleware, e store.Event) (store.Event, error) {
 	var stored store.Event
-	err := mw.Append(context.Background(), nil, e, func(_ context.Context, _ pgx.Tx, ev store.Event) error {
-		stored = ev
+	err := mw.Append(context.Background(), []store.Event{e}, func(_ context.Context, events []store.Event) error {
+		stored = events[0]
 		return nil
 	})
+	return stored, err
+}
+
+func TestEncryptionMiddlewareRoundTrip(t *testing.T) {
+	mw := store.NewEncryptionMiddleware(bytes.Repeat([]byte("k"), 32))
+	plaintext := []byte("hello world")
+	stored, err := appendThrough(mw, store.Event{StreamID: uuid.New(), Data: plaintext})
 	if err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -37,70 +36,48 @@ func TestEncryptionMiddlewareRoundTrip(t *testing.T) {
 }
 
 func TestEncryptionMiddlewareStoredDataIsOpaque(t *testing.T) {
-	masterKey := bytes.Repeat([]byte("k"), 32)
-	mw := store.NewEncryptionMiddleware(masterKey)
-
+	mw := store.NewEncryptionMiddleware(bytes.Repeat([]byte("k"), 32))
 	plaintext := []byte("secret data")
-	e := store.Event{StreamID: uuid.New(), Data: plaintext}
-
-	var stored store.Event
-	_ = mw.Append(context.Background(), nil, e, func(_ context.Context, _ pgx.Tx, ev store.Event) error {
-		stored = ev
-		return nil
-	})
-
+	stored, err := appendThrough(mw, store.Event{StreamID: uuid.New(), Data: plaintext})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if bytes.Equal(stored.Data, plaintext) {
 		t.Fatal("stored data must not equal plaintext")
 	}
 }
 
 func TestEncryptionMiddlewareDifferentStreamsProduceDifferentCiphertext(t *testing.T) {
-	masterKey := bytes.Repeat([]byte("k"), 32)
-	mw := store.NewEncryptionMiddleware(masterKey)
-
+	mw := store.NewEncryptionMiddleware(bytes.Repeat([]byte("k"), 32))
 	plaintext := []byte("same plaintext")
 
-	var ct1, ct2 []byte
-	for i, target := range []*[]byte{&ct1, &ct2} {
-		e := store.Event{StreamID: uuid.New(), Data: plaintext}
-		_ = i
-		_ = mw.Append(context.Background(), nil, e, func(_ context.Context, _ pgx.Tx, ev store.Event) error {
-			*target = ev.Data
-			return nil
-		})
+	var ciphertext [2][]byte
+	for i := range ciphertext {
+		stored, err := appendThrough(mw, store.Event{StreamID: uuid.New(), Data: plaintext})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ciphertext[i] = stored.Data
 	}
-
-	if bytes.Equal(ct1, ct2) {
+	if bytes.Equal(ciphertext[0], ciphertext[1]) {
 		t.Fatal("different stream IDs must produce different ciphertext")
 	}
 }
 
 func TestEncryptionMiddlewareWrongMasterKeyFails(t *testing.T) {
-	masterKey := bytes.Repeat([]byte("k"), 32)
-	wrongKey := bytes.Repeat([]byte("x"), 32)
-
-	mw := store.NewEncryptionMiddleware(masterKey)
-	mwWrong := store.NewEncryptionMiddleware(wrongKey)
-
-	streamID := uuid.New()
-	e := store.Event{StreamID: streamID, Data: []byte("secret")}
-
-	var stored store.Event
-	_ = mw.Append(context.Background(), nil, e, func(_ context.Context, _ pgx.Tx, ev store.Event) error {
-		stored = ev
-		return nil
-	})
-
-	_, err := mwWrong.OnRead(context.Background(), stored)
-	if err == nil {
+	mw := store.NewEncryptionMiddleware(bytes.Repeat([]byte("k"), 32))
+	mwWrong := store.NewEncryptionMiddleware(bytes.Repeat([]byte("x"), 32))
+	stored, err := appendThrough(mw, store.Event{StreamID: uuid.New(), Data: []byte("secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mwWrong.OnRead(context.Background(), stored); err == nil {
 		t.Fatal("expected decryption error with wrong master key")
 	}
 }
 
 func TestEncryptionMiddlewareEmptyDataPassesThrough(t *testing.T) {
-	masterKey := bytes.Repeat([]byte("k"), 32)
-	mw := store.NewEncryptionMiddleware(masterKey)
-
+	mw := store.NewEncryptionMiddleware(bytes.Repeat([]byte("k"), 32))
 	e := store.Event{StreamID: uuid.New(), Data: nil}
 	result, err := mw.OnRead(context.Background(), e)
 	if err != nil {

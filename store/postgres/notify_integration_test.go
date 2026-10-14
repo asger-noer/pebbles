@@ -82,112 +82,18 @@ func newNotifyFixture(t *testing.T) (*stream.Repository[struct{}, pebbles.Event]
 	return stream.NewRepository(customerCodecs, st), wake, st
 }
 
-// TestNotifyOnAppend proves an append outside a transaction wakes a listener,
-// which is what lets a projection runner react to a write instead of waiting
-// out its poll interval.
+// TestNotifyOnAppend proves a committed append wakes a listener, which lets a
+// projection runner react to a write instead of waiting out its poll interval.
 func TestNotifyOnAppend(t *testing.T) {
 	ctx := context.Background()
 	customers, wake, _ := newNotifyFixture(t)
 
-	if err := customers.Append(ctx, nil, uuid.New(), &customerv1.CustomerNameUpdated{Name: "Ada"}); err != nil {
+	if err := customers.Append(ctx, uuid.New(), &customerv1.CustomerNameUpdated{Name: "Ada"}); err != nil {
 		t.Fatalf("appending: %v", err)
 	}
 
 	if !waitForWakeup(t, wake) {
 		t.Fatal("append did not deliver a wake-up")
-	}
-}
-
-// TestNotifyDeliveredOnCommit proves the notification is withheld until the
-// appending transaction commits. A runner woken before the commit could not
-// read the event anyway, so an early wake-up would be a wasted poll.
-func TestNotifyDeliveredOnCommit(t *testing.T) {
-	ctx := context.Background()
-	customers, wake, _ := newNotifyFixture(t)
-
-	pool := newTestPool(t)
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx: %v", err)
-	}
-
-	if err := customers.Append(ctx, tx, uuid.New(), &customerv1.CustomerNameUpdated{Name: "Grace"}); err != nil {
-		t.Fatalf("appending in tx: %v", err)
-	}
-
-	select {
-	case <-wake:
-		t.Fatal("wake-up delivered before commit")
-	case <-time.After(250 * time.Millisecond):
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-
-	if !waitForWakeup(t, wake) {
-		t.Fatal("commit did not deliver a wake-up")
-	}
-}
-
-// TestNotifySuppressedOnRollback proves a rolled-back append announces nothing,
-// so listeners are never told about a write that did not happen.
-func TestNotifySuppressedOnRollback(t *testing.T) {
-	ctx := context.Background()
-	customers, wake, _ := newNotifyFixture(t)
-
-	pool := newTestPool(t)
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx: %v", err)
-	}
-	if err := customers.Append(ctx, tx, uuid.New(), &customerv1.CustomerNameUpdated{Name: "Edsger"}); err != nil {
-		t.Fatalf("appending in tx: %v", err)
-	}
-	if err := tx.Rollback(ctx); err != nil {
-		t.Fatalf("rollback: %v", err)
-	}
-
-	select {
-	case <-wake:
-		t.Fatal("wake-up delivered for a rolled-back append")
-	case <-time.After(500 * time.Millisecond):
-	}
-}
-
-// TestNotifyCoalescesWithinTransaction proves that appending several events in
-// one transaction wakes listeners once rather than once per event — Postgres
-// collapses duplicate (channel, payload) notifications per transaction.
-func TestNotifyCoalescesWithinTransaction(t *testing.T) {
-	ctx := context.Background()
-	customers, wake, _ := newNotifyFixture(t)
-
-	pool := newTestPool(t)
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx: %v", err)
-	}
-	if err := customers.Append(ctx, tx, uuid.New(),
-		&customerv1.CustomerNameUpdated{Name: "one"},
-		&customerv1.CustomerNameUpdated{Name: "two"},
-		&customerv1.CustomerNameUpdated{Name: "three"},
-	); err != nil {
-		t.Fatalf("appending in tx: %v", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-
-	if !waitForWakeup(t, wake) {
-		t.Fatal("commit did not deliver a wake-up")
-	}
-	// The subscriber channel holds one pending wake-up, so this only shows the
-	// coalescing did not overflow into a second delivery; it is the observable
-	// half of the guarantee.
-	select {
-	case <-wake:
-		t.Fatal("three events in one transaction delivered more than one wake-up")
-	case <-time.After(250 * time.Millisecond):
 	}
 }
 
@@ -230,7 +136,7 @@ func TestNotifyFanOut(t *testing.T) {
 	codec.Register[*customerv1.CustomerNameUpdated](customerCodecs)
 	customers := stream.NewRepository(customerCodecs, st)
 
-	if err := customers.Append(ctx, nil, uuid.New(), &customerv1.CustomerNameUpdated{Name: "Barbara"}); err != nil {
+	if err := customers.Append(ctx, uuid.New(), &customerv1.CustomerNameUpdated{Name: "Barbara"}); err != nil {
 		t.Fatalf("appending: %v", err)
 	}
 
@@ -332,7 +238,7 @@ func TestWakeupBeatsPollInterval(t *testing.T) {
 
 	streamID := uuid.New()
 	customers := stream.NewRepository(customerCodecs, st)
-	if err := customers.Append(ctx, nil, streamID, &customerv1.CustomerNameUpdated{Name: "Katherine"}); err != nil {
+	if err := customers.Append(ctx, streamID, &customerv1.CustomerNameUpdated{Name: "Katherine"}); err != nil {
 		t.Fatalf("appending: %v", err)
 	}
 

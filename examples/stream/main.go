@@ -78,7 +78,7 @@ func main() {
 	// Write side: append the order's events through a repository.
 	orders := stream.NewRepository(codecs, st)
 	orderID := uuid.New()
-	if err := orders.Append(ctx, nil, orderID,
+	if err := orders.Append(ctx, orderID,
 		&orderv2.ItemAdded{Name: "Keyboard", PriceCents: 4200, CurrencyCode: "USD"},
 		&orderv2.ItemAdded{Name: "Mouse", PriceCents: 1800, CurrencyCode: "USD"},
 		&orderv1.OrderShipped{Tracking: "1Z999AA10123456784"},

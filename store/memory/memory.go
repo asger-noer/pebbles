@@ -7,7 +7,6 @@ import (
 
 	"github.com/asger-noer/pebbles/store"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
 // Engine is an in-memory implementation of store.Engine.
@@ -51,20 +50,45 @@ func New() *Engine {
 	}
 }
 
-// Append persists e. tx is ignored — the in-memory engine has no real
-// transaction concept.
-func (s *Engine) Append(ctx context.Context, tx pgx.Tx, e store.Event) error {
+// Append persists one event.
+func (s *Engine) Append(ctx context.Context, e store.Event) error {
+	return s.AppendBatch(ctx, []store.Event{e})
+}
+
+// AppendBatch persists all events or none.
+func (s *Engine) AppendBatch(ctx context.Context, events []store.Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := streamKey{e.StreamType, e.StreamID}
-	for _, idx := range s.streams[key] {
-		if s.log[idx].Sequence == e.Sequence {
+	if len(events) == 0 {
+		return nil
+	}
+	first := events[0]
+	seen := make(map[streamKey]map[int64]struct{})
+	for _, e := range events {
+		if e.StreamType != first.StreamType || e.StreamID != first.StreamID {
+			return store.ErrMixedStreams
+		}
+		key := streamKey{e.StreamType, e.StreamID}
+		if seen[key] == nil {
+			seen[key] = make(map[int64]struct{})
+		}
+		if _, exists := seen[key][e.Sequence]; exists {
 			return store.ErrConflict
 		}
+		seen[key][e.Sequence] = struct{}{}
+		for _, idx := range s.streams[key] {
+			if s.log[idx].Sequence == e.Sequence {
+				return store.ErrConflict
+			}
+		}
 	}
-	s.streams[key] = append(s.streams[key], len(s.log))
-	s.log = append(s.log, clone(e))
+
+	for _, e := range events {
+		key := streamKey{e.StreamType, e.StreamID}
+		s.streams[key] = append(s.streams[key], len(s.log))
+		s.log = append(s.log, clone(e))
+	}
 	return nil
 }
 
@@ -99,7 +123,7 @@ func (s *Engine) Read(ctx context.Context, streamType string, streamID uuid.UUID
 	return out, nil
 }
 
-func (s *Engine) LastSequence(ctx context.Context, tx pgx.Tx, streamType string, streamID uuid.UUID) (int64, error) {
+func (s *Engine) LastSequence(ctx context.Context, streamType string, streamID uuid.UUID) (int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

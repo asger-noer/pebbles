@@ -56,7 +56,7 @@ func appendToStream(t *testing.T, s *memory.Engine, codecs codec.Registrar, stre
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(context.Background(), nil, store.Event{
+	if err := s.Append(context.Background(), store.Event{
 		ID:         id,
 		StreamType: codecs.StreamType(),
 		StreamID:   streamID,

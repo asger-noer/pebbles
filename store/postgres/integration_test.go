@@ -2,13 +2,13 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 
 	"github.com/asger-noer/pebbles"
 	"github.com/asger-noer/pebbles/codec"
 	customerv1 "github.com/asger-noer/pebbles/gen/pebbles/examples/customer/v1"
-	orderv1 "github.com/asger-noer/pebbles/gen/pebbles/examples/order/v1"
 	"github.com/asger-noer/pebbles/store"
 	"github.com/asger-noer/pebbles/store/postgres"
 	"github.com/asger-noer/pebbles/stream"
@@ -22,11 +22,13 @@ func (customerAggregate) StreamType() string                         { return "i
 func (customerAggregate) Initial() struct{}                          { return struct{}{} }
 func (customerAggregate) Apply(s struct{}, _ pebbles.Event) struct{} { return s }
 
-type orderAggregate struct{}
+type transitionAggregate struct{}
 
-func (orderAggregate) StreamType() string                         { return "integration-order" }
-func (orderAggregate) Initial() struct{}                          { return struct{}{} }
-func (orderAggregate) Apply(s struct{}, _ pebbles.Event) struct{} { return s }
+func (transitionAggregate) StreamType() string { return "integration-transition" }
+func (transitionAggregate) Initial() bool      { return false }
+func (transitionAggregate) Apply(_ bool, _ pebbles.Event) bool {
+	return true
+}
 
 // newTestPool connects to PEBBLES_TEST_DATABASE_URL, or skips the test if it
 // is not set.
@@ -44,74 +46,64 @@ func newTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// TestSharedTransactionCommits proves that two repositories backed by
-// different streams, sharing one pgx.Tx, become visible together only after
-// Commit.
-func TestSharedTransactionCommits(t *testing.T) {
+func TestConcurrentExecuteRejectsStaleTransitionAcrossClients(t *testing.T) {
 	ctx := context.Background()
-	pool := newTestPool(t)
+	poolA := newTestPool(t)
+	poolB := newTestPool(t)
 
-	engine, err := postgres.New(ctx, pool)
+	engineA, err := postgres.New(ctx, poolA)
 	if err != nil {
-		t.Fatalf("creating engine: %v", err)
+		t.Fatalf("creating first engine: %v", err)
 	}
-	st := store.New(engine)
-
-	customerCodecs := codec.NewRegistry[customerAggregate]()
-	codec.Register[*customerv1.CustomerNameUpdated](customerCodecs)
-	orderCodecs := codec.NewRegistry[orderAggregate]()
-	codec.Register[*orderv1.CartMade](orderCodecs)
-
-	customers := stream.NewRepository(customerCodecs, st)
-	orders := stream.NewRepository(orderCodecs, st)
-
-	customerID, orderID := uuid.New(), uuid.New()
-
-	tx, err := pool.Begin(ctx)
+	engineB, err := postgres.New(ctx, poolB)
 	if err != nil {
-		t.Fatalf("begin tx: %v", err)
+		t.Fatalf("creating second engine: %v", err)
 	}
 
-	if err := customers.Append(ctx, tx, customerID, &customerv1.CustomerNameUpdated{Name: "Ada"}); err != nil {
-		t.Fatalf("appending customer: %v", err)
-	}
-	if err := orders.Append(ctx, tx, orderID, &orderv1.CartMade{CustomerId: customerID.String()}); err != nil {
-		t.Fatalf("appending order: %v", err)
-	}
+	codecsA := codec.NewRegistry[transitionAggregate]()
+	codec.Register[*customerv1.CustomerNameUpdated](codecsA)
+	codecsB := codec.NewRegistry[transitionAggregate]()
+	codec.Register[*customerv1.CustomerNameUpdated](codecsB)
+	repoA := stream.NewRepository(codecsA, store.New(engineA))
+	repoB := stream.NewRepository(codecsB, store.New(engineB))
+	id := uuid.New()
 
-	// Before commit, neither stream is visible outside the transaction.
-	customerEvents, err := st.Read(ctx, customerAggregate{}.StreamType(), customerID, 0)
+	loaded := make(chan struct{})
+	resume := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := repoA.Execute(ctx, id, func(context.Context, bool) ([]pebbles.Event, error) {
+			close(loaded)
+			<-resume
+			return []pebbles.Event{&customerv1.CustomerNameUpdated{Name: "completed"}}, nil
+		})
+		result <- err
+	}()
+
+	<-loaded
+	if _, err := repoB.Execute(ctx, id, func(_ context.Context, complete bool) ([]pebbles.Event, error) {
+		if complete {
+			t.Fatal("expected incomplete state")
+		}
+		return []pebbles.Event{&customerv1.CustomerNameUpdated{Name: "completed"}}, nil
+	}); err != nil {
+		t.Fatalf("executing first transition: %v", err)
+	}
+	close(resume)
+
+	if err := <-result; !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("want stale transition to return ErrConflict, got %v", err)
+	}
+	events, err := store.New(engineA).Read(ctx, transitionAggregate{}.StreamType(), id, 0)
 	if err != nil {
-		t.Fatalf("reading customer stream pre-commit: %v", err)
+		t.Fatalf("reading events: %v", err)
 	}
-	if len(customerEvents) != 0 {
-		t.Fatalf("want 0 customer events before commit, got %d", len(customerEvents))
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-
-	customerEvents, err = st.Read(ctx, customerAggregate{}.StreamType(), customerID, 0)
-	if err != nil {
-		t.Fatalf("reading customer stream post-commit: %v", err)
-	}
-	if len(customerEvents) != 1 {
-		t.Fatalf("want 1 customer event after commit, got %d", len(customerEvents))
-	}
-
-	orderEvents, err := st.Read(ctx, orderAggregate{}.StreamType(), orderID, 0)
-	if err != nil {
-		t.Fatalf("reading order stream post-commit: %v", err)
-	}
-	if len(orderEvents) != 1 {
-		t.Fatalf("want 1 order event after commit, got %d", len(orderEvents))
+	if len(events) != 1 {
+		t.Fatalf("want exactly one completion event, got %d", len(events))
 	}
 }
 
-// TestSharedTransactionRollsBack proves that a rollback leaves neither stream
-// persisted.
-func TestSharedTransactionRollsBack(t *testing.T) {
+func TestAppendMultipleEvents(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
 
@@ -121,87 +113,17 @@ func TestSharedTransactionRollsBack(t *testing.T) {
 	}
 	st := store.New(engine)
 
-	customerCodecs := codec.NewRegistry[customerAggregate]()
-	codec.Register[*customerv1.CustomerNameUpdated](customerCodecs)
-	orderCodecs := codec.NewRegistry[orderAggregate]()
-	codec.Register[*orderv1.CartMade](orderCodecs)
-
-	customers := stream.NewRepository(customerCodecs, st)
-	orders := stream.NewRepository(orderCodecs, st)
-
-	customerID, orderID := uuid.New(), uuid.New()
-
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx: %v", err)
-	}
-
-	if err := customers.Append(ctx, tx, customerID, &customerv1.CustomerNameUpdated{Name: "Ada"}); err != nil {
-		t.Fatalf("appending customer: %v", err)
-	}
-	if err := orders.Append(ctx, tx, orderID, &orderv1.CartMade{CustomerId: customerID.String()}); err != nil {
-		t.Fatalf("appending order: %v", err)
-	}
-
-	if err := tx.Rollback(ctx); err != nil {
-		t.Fatalf("rollback: %v", err)
-	}
-
-	customerEvents, err := st.Read(ctx, customerAggregate{}.StreamType(), customerID, 0)
-	if err != nil {
-		t.Fatalf("reading customer stream: %v", err)
-	}
-	if len(customerEvents) != 0 {
-		t.Fatalf("want 0 customer events after rollback, got %d", len(customerEvents))
-	}
-
-	orderEvents, err := st.Read(ctx, orderAggregate{}.StreamType(), orderID, 0)
-	if err != nil {
-		t.Fatalf("reading order stream: %v", err)
-	}
-	if len(orderEvents) != 0 {
-		t.Fatalf("want 0 order events after rollback, got %d", len(orderEvents))
-	}
-}
-
-// TestSharedTransactionSameStreamMultipleAppends proves that two Append calls
-// against the *same* stream, sharing one pgx.Tx, each see the other's
-// uncommitted write when computing the next sequence number — regressing
-// against a bug where LastSequence always read committed state, so a second
-// append in the same tx recomputed the first append's sequence and the
-// transaction failed on commit with store.ErrConflict.
-func TestSharedTransactionSameStreamMultipleAppends(t *testing.T) {
-	ctx := context.Background()
-	pool := newTestPool(t)
-
-	engine, err := postgres.New(ctx, pool)
-	if err != nil {
-		t.Fatalf("creating engine: %v", err)
-	}
-	st := store.New(engine)
-
-	customerCodecs := codec.NewRegistry[customerAggregate]()
-	codec.Register[*customerv1.CustomerNameUpdated](customerCodecs)
-	codec.Register[*customerv1.CustomerEmailUpdated](customerCodecs)
-
-	customers := stream.NewRepository(customerCodecs, st)
-
+	codecs := codec.NewRegistry[customerAggregate]()
+	codec.Register[*customerv1.CustomerNameUpdated](codecs)
+	codec.Register[*customerv1.CustomerEmailUpdated](codecs)
+	customers := stream.NewRepository(codecs, st)
 	customerID := uuid.New()
 
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx: %v", err)
-	}
-
-	if err := customers.Append(ctx, tx, customerID, &customerv1.CustomerNameUpdated{Name: "Ada"}); err != nil {
-		t.Fatalf("appending first event: %v", err)
-	}
-	if err := customers.Append(ctx, tx, customerID, &customerv1.CustomerEmailUpdated{Email: "ada@example.com"}); err != nil {
-		t.Fatalf("appending second event: %v", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit: %v", err)
+	if err := customers.Append(ctx, customerID,
+		&customerv1.CustomerNameUpdated{Name: "Ada"},
+		&customerv1.CustomerEmailUpdated{Email: "ada@example.com"},
+	); err != nil {
+		t.Fatalf("appending events: %v", err)
 	}
 
 	events, err := st.Read(ctx, customerAggregate{}.StreamType(), customerID, 0)
@@ -213,5 +135,20 @@ func TestSharedTransactionSameStreamMultipleAppends(t *testing.T) {
 	}
 	if events[0].Sequence != 1 || events[1].Sequence != 2 {
 		t.Fatalf("want sequences 1, 2, got %d, %d", events[0].Sequence, events[1].Sequence)
+	}
+
+	conflictingBatch := []store.Event{
+		{ID: uuid.New(), StreamType: customerAggregate{}.StreamType(), StreamID: customerID, Sequence: 3, Name: "test.Event"},
+		{ID: uuid.New(), StreamType: customerAggregate{}.StreamType(), StreamID: customerID, Sequence: 3, Name: "test.Event"},
+	}
+	if err := st.AppendBatch(ctx, conflictingBatch...); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("want conflicting batch to return ErrConflict, got %v", err)
+	}
+	events, err = st.Read(ctx, customerAggregate{}.StreamType(), customerID, 0)
+	if err != nil {
+		t.Fatalf("reading customer stream after conflict: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want failed batch to leave 2 events, got %d", len(events))
 	}
 }

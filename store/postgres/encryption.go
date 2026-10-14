@@ -37,20 +37,18 @@ func NewCryptoShredMiddleware(pool *pgxpool.Pool) *CryptoShredMiddleware {
 	}
 }
 
-// Append is the write-path hook. It:
-//  1. Auto-creates a key for new streams (ON CONFLICT DO NOTHING).
-//  2. Encrypts e.Data if a key exists (no-op for the tombstone, which has no data).
-//  3. Calls next to persist the event.
-//  4. After a successful tombstone write, deletes the stream's key (crypto-shred).
-func (m *CryptoShredMiddleware) Append(ctx context.Context, tx pgx.Tx, e store.Event, next store.AppendFunc) error {
-	isTombstone := e.Name == pebbles.DeletedName
-
+// Append creates keys and encrypts event data before persisting the batch. It
+// deletes keys for tombstoned streams after the batch succeeds.
+func (m *CryptoShredMiddleware) Append(ctx context.Context, events []store.Event, next store.AppendFunc) error {
 	q := m.queries
-	if tx != nil {
-		q = q.WithTx(tx)
-	}
+	var tombstones []uuid.UUID
+	for i := range events {
+		e := &events[i]
+		if e.Name == pebbles.DeletedName {
+			tombstones = append(tombstones, e.StreamID)
+			continue
+		}
 
-	if !isTombstone {
 		if err := m.ensureKey(ctx, q, e.StreamID); err != nil {
 			return err
 		}
@@ -70,16 +68,15 @@ func (m *CryptoShredMiddleware) Append(ctx context.Context, tx pgx.Tx, e store.E
 		}
 	}
 
-	if err := next(ctx, tx, e); err != nil {
+	if err := next(ctx, events); err != nil {
 		return err
 	}
 
-	if isTombstone {
-		if err := q.DeleteStreamKey(ctx, e.StreamID); err != nil {
+	for _, streamID := range tombstones {
+		if err := q.DeleteStreamKey(ctx, streamID); err != nil {
 			return fmt.Errorf("deleting stream key: %w", err)
 		}
 	}
-
 	return nil
 }
 

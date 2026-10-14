@@ -5,7 +5,6 @@ import (
 
 	"github.com/asger-noer/pebbles/internal/aesgcm"
 	"github.com/asger-noer/pebbles/store"
-	"github.com/jackc/pgx/v5"
 )
 
 // EncryptionMiddleware encrypts event data with AES-256-GCM using a key
@@ -26,18 +25,20 @@ func NewEncryptionMiddleware(masterKey []byte) *EncryptionMiddleware {
 	return &EncryptionMiddleware{masterKey: masterKey}
 }
 
-func (m *EncryptionMiddleware) Append(ctx context.Context, tx pgx.Tx, e store.Event, next store.AppendFunc) error {
-	key, err := aesgcm.DeriveKey(m.masterKey, e.StreamID)
-	if err != nil {
-		return err
+func (m *EncryptionMiddleware) Append(ctx context.Context, events []store.Event, next store.AppendFunc) error {
+	for i := range events {
+		key, err := aesgcm.DeriveKey(m.masterKey, events[i].StreamID)
+		if err != nil {
+			return err
+		}
+
+		events[i].Data, err = aesgcm.Encrypt(key, events[i].Data)
+		if err != nil {
+			return err
+		}
 	}
 
-	e.Data, err = aesgcm.Encrypt(key, e.Data)
-	if err != nil {
-		return err
-	}
-
-	return next(ctx, tx, e)
+	return next(ctx, events)
 }
 
 func (m *EncryptionMiddleware) OnRead(ctx context.Context, e store.Event) (store.Event, error) {

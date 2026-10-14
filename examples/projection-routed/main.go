@@ -134,20 +134,20 @@ func main() {
 	customerID := uuid.New()
 
 	// The customer's own stream (stream id == customer id).
-	if err := customers.Append(ctx, nil, customerID, &customerv1.CustomerNameUpdated{Name: "Ada"}); err != nil {
+	if err := customers.Append(ctx, customerID, &customerv1.CustomerNameUpdated{Name: "Ada"}); err != nil {
 		panic(err)
 	}
 
 	// Two orders for that customer, on their own streams.
 	order1, order2 := uuid.New(), uuid.New()
-	if err := orders.Append(ctx, nil, order1,
+	if err := orders.Append(ctx, order1,
 		&orderv1.CartMade{CustomerId: customerID.String()},
 		&orderv2.ItemAdded{Name: "Keyboard", PriceCents: 4200, CurrencyCode: "USD"},
 		&orderv2.ItemAdded{Name: "Mouse", PriceCents: 1800, CurrencyCode: "USD"},
 	); err != nil {
 		panic(err)
 	}
-	if err := orders.Append(ctx, nil, order2,
+	if err := orders.Append(ctx, order2,
 		&orderv1.CartMade{CustomerId: customerID.String()},
 		&orderv2.ItemAdded{Name: "USB Cable", PriceCents: 999, CurrencyCode: "USD"},
 	); err != nil {
