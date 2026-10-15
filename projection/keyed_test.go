@@ -14,6 +14,8 @@ import (
 	"github.com/asger-noer/pebbles/store"
 	"github.com/asger-noer/pebbles/store/memory"
 	"github.com/google/uuid"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // --- keyed test events ---
@@ -114,6 +116,37 @@ func TestKeyedManagedResolvesViaIndex(t *testing.T) {
 	if b.Orders != 1 || b.Spent != 999 {
 		t.Fatalf("custB: want {1 999}, got %+v", b)
 	}
+}
+
+func TestKeyedTelemetryUsesTraceProvider(t *testing.T) {
+	ctx := context.Background()
+	spanRecorder := tracetest.NewSpanRecorder()
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	t.Cleanup(func() { _ = tracerProvider.Shutdown(ctx) })
+
+	orderCodecs := newOrderCodecs(t)
+	engine := memory.New()
+	st := store.New(engine)
+	snaps := memory.NewKeyedSnapshotStore[CustomerOrders](engine)
+	customerID := uuid.New()
+	appendToStream(t, engine, orderCodecs, uuid.New(), 1, &orderv1.CartMade{CustomerId: customerID.String()})
+
+	proj := projection.NewKeyed(
+		customerOrders{}, st, snaps, []codec.Registrar{orderCodecs},
+		projection.WithPollInterval(time.Millisecond),
+		projection.WithTraceProvider(tracerProvider),
+	)
+	runUntil(t, proj.Run, func() bool {
+		model, _ := proj.Get(ctx, customerID)
+		return model.Orders == 1
+	})
+
+	for _, span := range spanRecorder.Ended() {
+		if span.Name() == "projection.event" {
+			return
+		}
+	}
+	t.Fatal("missing projection.event span")
 }
 
 func TestKeyedResumeKeepsIndex(t *testing.T) {

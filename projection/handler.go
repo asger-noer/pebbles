@@ -23,8 +23,13 @@ import (
 
 	"github.com/asger-noer/pebbles"
 	"github.com/asger-noer/pebbles/codec"
+	"github.com/asger-noer/pebbles/internal/telemetry"
 	"github.com/asger-noer/pebbles/store"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
+
+const traceScope = "github.com/asger-noer/pebbles/projection"
 
 // Handler consumes a bounded set of events across streams. It owns its read
 // model (a SQL view, a cache, ...) and its idempotency: a Runner delivers each
@@ -40,10 +45,13 @@ type Handler interface {
 type ErrorHandler func(p pebbles.Pebble[pebbles.Event], err error) error
 
 type options struct {
-	batchSize    int
-	pollInterval time.Duration
-	onError      ErrorHandler
-	wakeup       <-chan struct{}
+	batchSize       int
+	pollInterval    time.Duration
+	onError         ErrorHandler
+	wakeup          <-chan struct{}
+	traceProvider   trace.TracerProvider
+	metricsProvider metric.MeterProvider
+	recorder        telemetry.Recorder
 }
 
 func defaultOptions() options {
@@ -78,6 +86,16 @@ func WithErrorHandler(fn ErrorHandler) Option {
 	return func(o *options) { o.onError = fn }
 }
 
+// WithTraceProvider sets the OpenTelemetry provider used for spans.
+func WithTraceProvider(provider trace.TracerProvider) Option {
+	return func(o *options) { o.traceProvider = provider }
+}
+
+// WithMetricsProvider sets the OpenTelemetry provider used for metrics.
+func WithMetricsProvider(provider metric.MeterProvider) Option {
+	return func(o *options) { o.metricsProvider = provider }
+}
+
 // WithWakeup supplies a channel that signals "the log may have grown", so a
 // caught-up run reacts to a commit instead of waiting out its poll interval —
 // see postgres.Notifier for the Postgres NOTIFY implementation.
@@ -95,6 +113,7 @@ func resolveOptions(opts []Option) options {
 	for _, opt := range opts {
 		opt(&o)
 	}
+	o.recorder = telemetry.New(traceScope, o.traceProvider, o.metricsProvider)
 	return o
 }
 
@@ -115,7 +134,10 @@ type driver struct {
 // run blocks until ctx is cancelled (returning nil) or an unrecoverable error
 // occurs. It reads the log in batches from the loaded position, applies each
 // in-binding event, and commits the advanced position once per batch.
-func (d *driver) run(ctx context.Context) error {
+func (d *driver) run(ctx context.Context) (runErr error) {
+	ctx, finish := d.opts.recorder.Start(ctx, "projection.run")
+	defer func() { finish(runErr) }()
+
 	pos, err := d.load(ctx)
 	if err != nil {
 		if cancelled(ctx, err) {
@@ -161,7 +183,7 @@ func (d *driver) run(ctx context.Context) error {
 						Headers:    rec.Event.Headers,
 						Event:      &pebbles.Deleted{},
 					}
-					if err := d.apply(ctx, pebble); err != nil {
+					if err := d.applyEvent(ctx, pebble); err != nil {
 						if cancelled(ctx, err) {
 							return nil
 						}
@@ -203,7 +225,7 @@ func (d *driver) run(ctx context.Context) error {
 				Event:      ev,
 			}
 
-			if err := d.apply(ctx, pebble); err != nil {
+			if err := d.applyEvent(ctx, pebble); err != nil {
 				if cancelled(ctx, err) {
 					return nil
 				}
@@ -223,6 +245,13 @@ func (d *driver) run(ctx context.Context) error {
 			return fmt.Errorf("committing position %d: %w", pos, err)
 		}
 	}
+}
+
+func (d *driver) applyEvent(ctx context.Context, p pebbles.Pebble[pebbles.Event]) error {
+	ctx, finish := d.opts.recorder.Start(ctx, "projection.event")
+	err := d.apply(ctx, p)
+	finish(err)
+	return err
 }
 
 // cancelled reports whether err is just the consequence of ctx being cancelled,
