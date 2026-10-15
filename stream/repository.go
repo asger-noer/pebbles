@@ -24,6 +24,7 @@ type Repository[S any, E pebbles.Event] struct {
 	codecs     codec.Registrar
 	store      *store.Store
 	folder     *fold.Folder[S, E]
+	opts       options
 }
 
 // NewRepository constructs a Repository for aggregate A. The stream type and
@@ -33,6 +34,7 @@ type Repository[S any, E pebbles.Event] struct {
 func NewRepository[S any, E pebbles.Event, A pebbles.Aggregate[S, E]](
 	codecs *codec.Registry[A],
 	s *store.Store,
+	opts ...Option,
 ) *Repository[S, E] {
 	var agg A
 	return &Repository[S, E]{
@@ -40,12 +42,15 @@ func NewRepository[S any, E pebbles.Event, A pebbles.Aggregate[S, E]](
 		codecs:     codecs,
 		store:      s,
 		folder:     fold.New(s, codecs, agg),
+		opts:       resolveOptions(opts),
 	}
 }
 
 // Load reads all events for streamID and folds them through Aggregate.Apply,
 // returning the latest state. Returns Initial() if the stream is empty.
-func (r *Repository[S, E]) Load(ctx context.Context, streamID uuid.UUID) (S, error) {
+func (r *Repository[S, E]) Load(ctx context.Context, streamID uuid.UUID) (state S, err error) {
+	ctx, finish := r.opts.recorder.Start(ctx, "stream.repository.load")
+	defer func() { finish(err) }()
 	return r.folder.Fold(ctx, streamID)
 }
 
@@ -67,7 +72,10 @@ func (r *Repository[S, E]) Execute(
 	ctx context.Context,
 	streamID uuid.UUID,
 	fn ExecuteFunc[S, E],
-) (S, error) {
+) (result S, err error) {
+	ctx, finish := r.opts.recorder.Start(ctx, "stream.repository.execute")
+	defer func() { finish(err) }()
+
 	var zero S
 	state, revision, err := r.folder.FoldWithSequence(ctx, streamID)
 	if err != nil {
@@ -94,7 +102,10 @@ func (r *Repository[S, E]) Execute(
 // in the pipeline (e.g. CryptoShredMiddleware) handles post-write cleanup such
 // as crypto-shredding the stream's key. Returns [store.ErrConflict] on a
 // concurrent writer.
-func (r *Repository[S, E]) Delete(ctx context.Context, streamID uuid.UUID) error {
+func (r *Repository[S, E]) Delete(ctx context.Context, streamID uuid.UUID) (err error) {
+	ctx, finish := r.opts.recorder.Start(ctx, "stream.repository.delete")
+	defer func() { finish(err) }()
+
 	last, err := r.store.LastSequence(ctx, r.streamType, streamID)
 	if err != nil {
 		return fmt.Errorf("fetching last sequence: %w", err)
@@ -126,7 +137,10 @@ func (r *Repository[S, E]) Delete(ctx context.Context, streamID uuid.UUID) error
 // Append writes events in order, auto-assigning sequence numbers starting at
 // LastSequence+1. Returns [store.ErrConflict] if a concurrent writer beat us to
 // a sequence — callers should reload state and retry.
-func (r *Repository[S, E]) Append(ctx context.Context, streamID uuid.UUID, events ...E) error {
+func (r *Repository[S, E]) Append(ctx context.Context, streamID uuid.UUID, events ...E) (err error) {
+	ctx, finish := r.opts.recorder.Start(ctx, "stream.repository.append")
+	defer func() { finish(err) }()
+
 	if len(events) == 0 {
 		return nil
 	}

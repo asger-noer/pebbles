@@ -12,6 +12,11 @@ import (
 	"github.com/asger-noer/pebbles/store/memory"
 	"github.com/asger-noer/pebbles/stream"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/codes"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	metricdata "go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 type orderAggregate struct{}
@@ -43,6 +48,91 @@ func newOrderRegistry(t *testing.T) *codec.Registry[orderAggregate] {
 func newRepo(t *testing.T, s *store.Store) *stream.Repository[Summary, pebbles.Event] {
 	t.Helper()
 	return stream.NewRepository(newOrderRegistry(t), s)
+}
+
+func TestRepositoryTelemetryRecordsSpansDurationsAndErrors(t *testing.T) {
+	ctx := context.Background()
+	spanRecorder := tracetest.NewSpanRecorder()
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	t.Cleanup(func() { _ = tracerProvider.Shutdown(ctx) })
+
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = meterProvider.Shutdown(ctx) })
+
+	st := store.New(memory.New())
+	repo := stream.NewRepository(
+		newOrderRegistry(t),
+		st,
+		stream.WithTraceProvider(tracerProvider),
+		stream.WithMetricsProvider(meterProvider),
+	)
+	id := uuid.New()
+	if err := repo.Append(ctx, id, &orderv2.ItemAdded{Name: "Keyboard", PriceCents: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Load(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Delete(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Load(ctx, id); !errors.Is(err, pebbles.ErrDeleted) {
+		t.Fatalf("want ErrDeleted, got %v", err)
+	}
+
+	wantSpans := map[string]bool{
+		"stream.repository.append": false,
+		"stream.repository.load":   false,
+		"stream.repository.delete": false,
+	}
+	var failedLoad bool
+	for _, span := range spanRecorder.Ended() {
+		if _, ok := wantSpans[span.Name()]; ok {
+			wantSpans[span.Name()] = true
+		}
+		if span.Name() == "stream.repository.load" && span.Status().Code == codes.Error {
+			failedLoad = true
+		}
+	}
+	for name, found := range wantSpans {
+		if !found {
+			t.Errorf("missing span %q", name)
+		}
+	}
+	if !failedLoad {
+		t.Error("expected failed Load span to have error status")
+	}
+
+	rm := &metricdata.ResourceMetrics{}
+	if err := reader.Collect(ctx, rm); err != nil {
+		t.Fatal(err)
+	}
+	var durationCount, errorCount uint64
+	for _, scope := range rm.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			switch data := metric.Data.(type) {
+			case metricdata.Histogram[float64]:
+				if metric.Name == "pebbles.operation.duration" {
+					for _, point := range data.DataPoints {
+						durationCount += point.Count
+					}
+				}
+			case metricdata.Sum[int64]:
+				if metric.Name == "pebbles.operation.errors" {
+					for _, point := range data.DataPoints {
+						errorCount += uint64(point.Value)
+					}
+				}
+			}
+		}
+	}
+	if durationCount != 4 {
+		t.Errorf("want 4 operation durations, got %d", durationCount)
+	}
+	if errorCount != 1 {
+		t.Errorf("want 1 operation error, got %d", errorCount)
+	}
 }
 
 func TestRepositoryAppendAndLoad(t *testing.T) {

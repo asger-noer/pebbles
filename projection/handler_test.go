@@ -13,6 +13,10 @@ import (
 	"github.com/asger-noer/pebbles/projection"
 	"github.com/asger-noer/pebbles/store"
 	"github.com/asger-noer/pebbles/store/memory"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	metricdata "go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // collector is a Handler that records the message names it receives.
@@ -35,6 +39,65 @@ func (c *collector) count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.seen)
+}
+
+func TestRunnerTelemetryRecordsRunAndEvent(t *testing.T) {
+	ctx := context.Background()
+	spanRecorder := tracetest.NewSpanRecorder()
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	t.Cleanup(func() { _ = tracerProvider.Shutdown(ctx) })
+
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = meterProvider.Shutdown(ctx) })
+
+	codecs := newRegistry(t)
+	engine := memory.New()
+	st := store.New(engine)
+	cp := memory.NewCheckpointStore(engine)
+	appendEvent(t, engine, codecs, 1, &orderv2.ItemAdded{Name: "Keyboard", PriceCents: 1})
+
+	h := &collector{subs: pebbles.Subscribe(orderStream{}, &orderv2.ItemAdded{})}
+	r := projection.NewRunner(
+		st, cp, h, []codec.Registrar{codecs},
+		projection.WithPollInterval(time.Millisecond),
+		projection.WithTraceProvider(tracerProvider),
+		projection.WithMetricsProvider(meterProvider),
+	)
+	runUntil(t, r.Run, func() bool { return h.count() == 1 })
+
+	wantSpans := map[string]bool{"projection.run": false, "projection.event": false}
+	for _, span := range spanRecorder.Ended() {
+		if _, ok := wantSpans[span.Name()]; ok {
+			wantSpans[span.Name()] = true
+		}
+	}
+	for name, found := range wantSpans {
+		if !found {
+			t.Errorf("missing span %q", name)
+		}
+	}
+
+	rm := &metricdata.ResourceMetrics{}
+	if err := reader.Collect(ctx, rm); err != nil {
+		t.Fatal(err)
+	}
+	var durationCount uint64
+	for _, scope := range rm.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			if metric.Name != "pebbles.operation.duration" {
+				continue
+			}
+			if data, ok := metric.Data.(metricdata.Histogram[float64]); ok {
+				for _, point := range data.DataPoints {
+					durationCount += point.Count
+				}
+			}
+		}
+	}
+	if durationCount != 2 {
+		t.Errorf("want 2 operation durations, got %d", durationCount)
+	}
 }
 
 func TestRunnerHandlesAndResumesFromCheckpoint(t *testing.T) {
